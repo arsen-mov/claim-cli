@@ -1,0 +1,33 @@
+version: 1
+current-context: local
+defaults:
+  output_dir: ""
+  ai_api_version: v1
+  format: raw
+  attachments: true
+  copy: false
+contexts:
+  local:
+    ai_api_url: http://0.0.0.0:8001
+    ai_auth_url: http://0.0.0.0:8002
+    ai_api_username: admin
+    ai_api_password: admin
+    claimhub_base_url: https://claimhub.example.com
+    claimhub_api_url: https://api.claimhub.example.com
+    claimhub_api_token: token
+    claimhub_tenant: ancileo
+    claimhub_country_code: sg
+    claimhub_email: replace-me@example.com
+    claimhub_password: replace-me
+  uat:
+    ai_api_url: http://api.sandbox.ancileo.uat
+    ai_auth_url: http://auth.ancileo.uat
+    ai_api_username: replace-me
+    ai_api_password: replace-me
+    claimhub_base_url: https://claimhub-uat.example.com
+    claimhub_api_url: https://api.claimhub-uat.example.com
+    claimhub_api_token: replace-me
+    claimhub_tenant: ancileo-uat
+    claimhub_country_code: sg
+    claimhub_email: replace-me@example.com
+    claimhub_password: replace-me
