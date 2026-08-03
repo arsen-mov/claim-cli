@@ -265,21 +265,32 @@ func runGetCommand(configPath, contextOverride string, args []string) error {
 	}
 	logf("context=%s claimhub_tenant=%s ai=%s format=%s attachments=%t copy=%t", rt.contextName, rt.context.ClaimHubTenant, rt.context.AIAPIURL, selectedFormat, includeAttachments, shouldCopyOutput)
 
-	claim, err := fetchClaim(rt, *claimID, *claimNo)
+	claim, claimRaw, err := fetchClaim(rt, *claimID, *claimNo)
 	if err != nil {
 		return err
 	}
 
+	var attachmentsRaw []json.RawMessage
 	if includeAttachments {
-		atts, err := fetchAttachments(rt, claim)
+		atts, attsRaw, err := fetchAttachments(rt, claim)
 		if err != nil {
 			return err
 		}
 		claim["attachments"] = atts
+		attachmentsRaw = attsRaw
 	}
 
-	result := any(claim)
-	if selectedFormat != "raw" {
+	var result any = claim
+	if selectedFormat == "raw" {
+		finalRaw := claimRaw
+		if includeAttachments {
+			finalRaw, err = injectRawField(finalRaw, "attachments", marshalRawArray(attachmentsRaw))
+			if err != nil {
+				return err
+			}
+		}
+		result = json.RawMessage(finalRaw)
+	} else {
 		converted, err := toInternalClaim(rt, claim, selectedFormat == "summary")
 		if err != nil {
 			return err
@@ -345,7 +356,7 @@ func runResolveCommand(configPath, contextOverride string, args []string) error 
 	}
 	logf("context=%s claimhub_tenant=%s resolve", rt.contextName, rt.context.ClaimHubTenant)
 
-	claim, err := fetchClaim(rt, *claimID, *claimNo)
+	claim, _, err := fetchClaim(rt, *claimID, *claimNo)
 	if err != nil {
 		return err
 	}
@@ -418,11 +429,11 @@ func runDownloadCommand(configPath, contextOverride string, args []string) error
 		return nil
 	}
 
-	claim, err := fetchClaim(rt, *claimID, *claimNo)
+	claim, _, err := fetchClaim(rt, *claimID, *claimNo)
 	if err != nil {
 		return err
 	}
-	attachments, err := fetchAttachments(rt, claim)
+	attachments, _, err := fetchAttachments(rt, claim)
 	if err != nil {
 		return err
 	}
@@ -631,70 +642,81 @@ func resolveAttachmentsOutputDir(rt runtimeConfig, outputOverride string) string
 	return filepath.Join(rt.outputDir, "attachments")
 }
 
-func fetchClaim(rt runtimeConfig, claimID, claimNo int) (map[string]any, error) {
+func fetchClaim(rt runtimeConfig, claimID, claimNo int) (map[string]any, []byte, error) {
 	if claimID != 0 {
 		return fetchClaimByID(rt, claimID)
 	}
 	return fetchClaimByNo(rt, claimNo)
 }
 
-func fetchClaimByID(rt runtimeConfig, claimID int) (map[string]any, error) {
+func fetchClaimByID(rt runtimeConfig, claimID int) (map[string]any, []byte, error) {
 	logf("fetching claim by id=%d via %s/p/api/insurance/%d", claimID, strings.TrimRight(rt.context.ClaimHubBaseURL, "/"), claimID)
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(rt.context.ClaimHubBaseURL, "/")+fmt.Sprintf("/p/api/insurance/%d", claimID), nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("X-AUTH-TOKEN", rt.context.ClaimHubAPIToken)
+	raw, err := doJSONRaw(rt.client, req)
+	if err != nil {
+		return nil, nil, err
+	}
 	var claim map[string]any
-	if err := doJSON(rt.client, req, &claim); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &claim); err != nil {
+		return nil, nil, err
 	}
 	if claim == nil {
-		return nil, fmt.Errorf("claim %d not found", claimID)
+		return nil, nil, fmt.Errorf("claim %d not found", claimID)
 	}
 	logf("claim fetch succeeded for id=%d", claimID)
-	return claim, nil
+	return claim, raw, nil
 }
 
-func fetchClaimByNo(rt runtimeConfig, claimNo int) (map[string]any, error) {
+func fetchClaimByNo(rt runtimeConfig, claimNo int) (map[string]any, []byte, error) {
 	logf("fetching claim by no=%d via %s/x/p/s/%s/%s/insurance/%d", claimNo, strings.TrimRight(rt.context.ClaimHubBaseURL, "/"), rt.context.ClaimHubTenant, rt.context.ClaimHubCountryCode, claimNo)
 	path := fmt.Sprintf("/x/p/s/%s/%s/insurance/%d", rt.context.ClaimHubTenant, rt.context.ClaimHubCountryCode, claimNo)
+	raw, err := doTenantJSONRaw(rt, http.MethodGet, path, nil, false)
+	if err != nil {
+		return nil, nil, err
+	}
 	var claim map[string]any
-	if err := doTenantJSON(rt, http.MethodGet, path, nil, &claim, false); err != nil {
-		return nil, err
+	if err := json.Unmarshal(raw, &claim); err != nil {
+		return nil, nil, err
 	}
 	if claim == nil {
-		return nil, fmt.Errorf("claim no %d not found", claimNo)
+		return nil, nil, fmt.Errorf("claim no %d not found", claimNo)
 	}
 	logf("claim fetch succeeded for no=%d", claimNo)
-	return claim, nil
+	return claim, raw, nil
 }
 
-func fetchAttachments(rt runtimeConfig, claim map[string]any) ([]map[string]any, error) {
+func fetchAttachments(rt runtimeConfig, claim map[string]any) ([]map[string]any, []json.RawMessage, error) {
 	claimNo, ok := asInt(claim["no"])
 	if !ok {
 		claimID, idOK := asInt(claim["id"])
 		if !idOK {
-			return nil, errors.New("claim has no id or no field")
+			return nil, nil, errors.New("claim has no id or no field")
 		}
-		resolved, err := fetchClaimByID(rt, claimID)
+		resolved, _, err := fetchClaimByID(rt, claimID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		claimNo, ok = asInt(resolved["no"])
 		if !ok {
-			return nil, fmt.Errorf("claim %d has no claim number", claimID)
+			return nil, nil, fmt.Errorf("claim %d has no claim number", claimID)
 		}
 	}
 	path := fmt.Sprintf("/x/p/s/%s/%s/insurance/%d/attachments", rt.context.ClaimHubTenant, rt.context.ClaimHubCountryCode, claimNo)
 	logf("fetching attachments for claim_no=%d", claimNo)
-	var payload any
-	if err := doTenantJSON(rt, http.MethodGet, path, nil, &payload, false); err != nil {
-		return nil, err
+	raw, err := doTenantJSONRaw(rt, http.MethodGet, path, nil, false)
+	if err != nil {
+		return nil, nil, err
 	}
-	attachments := normalizeAttachments(payload)
+	attachments, rawItems, err := attachmentItemsFromRaw(raw)
+	if err != nil {
+		return nil, nil, err
+	}
 	logf("attachments fetch succeeded for claim_no=%d count=%d", claimNo, len(attachments))
-	return attachments, nil
+	return attachments, rawItems, nil
 }
 
 func downloadBySecureID(rt runtimeConfig, secureID, outputDir, fileName string) (string, error) {
@@ -722,47 +744,63 @@ func downloadBySecureID(rt runtimeConfig, secureID, outputDir, fileName string) 
 }
 
 func doJSON(client *http.Client, req *http.Request, target any) error {
-	resp, err := client.Do(req)
+	raw, err := doJSONRaw(client, req)
 	if err != nil {
 		return err
+	}
+	return json.Unmarshal(raw, target)
+}
+
+func doJSONRaw(client *http.Client, req *http.Request) ([]byte, error) {
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("request failed: status=%d preview=%q", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("request failed: status=%d preview=%q", resp.StatusCode, string(body))
 	}
-	return json.NewDecoder(resp.Body).Decode(target)
+	return io.ReadAll(resp.Body)
 }
 
 func doTenantJSON(rt runtimeConfig, method, path string, body io.Reader, target any, retried bool) error {
-	cookies, err := loadTenantCookies(rt, retried)
+	raw, err := doTenantJSONRaw(rt, method, path, body, retried)
 	if err != nil {
 		return err
 	}
+	return json.Unmarshal(raw, target)
+}
+
+func doTenantJSONRaw(rt runtimeConfig, method, path string, body io.Reader, retried bool) ([]byte, error) {
+	cookies, err := loadTenantCookies(rt, retried)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequest(method, strings.TrimRight(rt.context.ClaimHubBaseURL, "/")+path, body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Cookie", cookieHeader(cookies))
 	resp, err := rt.client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 		if retried {
 			bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			return fmt.Errorf("tenant request failed: status=%d preview=%q", resp.StatusCode, string(bodyPreview))
+			return nil, fmt.Errorf("tenant request failed: status=%d preview=%q", resp.StatusCode, string(bodyPreview))
 		}
 		logf("tenant request got status=%d, refreshing session cookie and retrying", resp.StatusCode)
 		_, _ = loadTenantCookies(rt, true)
-		return doTenantJSON(rt, method, path, body, target, true)
+		return doTenantJSONRaw(rt, method, path, body, true)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		bodyPreview, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return fmt.Errorf("tenant request failed: status=%d preview=%q", resp.StatusCode, string(bodyPreview))
+		return nil, fmt.Errorf("tenant request failed: status=%d preview=%q", resp.StatusCode, string(bodyPreview))
 	}
-	return json.NewDecoder(resp.Body).Decode(target)
+	return io.ReadAll(resp.Body)
 }
 
 func doTenantBytes(rt runtimeConfig, method, path string, retried bool) ([]byte, error) {
@@ -1040,7 +1078,13 @@ func saveOutputFile(outputDir string, result any) (string, error) {
 func outputName(result any) string {
 	claimID := "unknown-id"
 	claimNo := "unknown-no"
-	if resultMap, ok := result.(map[string]any); ok {
+	resultMap, ok := result.(map[string]any)
+	if !ok {
+		if raw, ok := result.(json.RawMessage); ok {
+			_ = json.Unmarshal(raw, &resultMap)
+		}
+	}
+	if resultMap != nil {
 		if value, ok := stringValue(resultMap["id"]); ok {
 			claimID = value
 		} else if claim, ok := resultMap["claim"].(map[string]any); ok {
@@ -1077,30 +1121,65 @@ func copyToClipboard(text string) bool {
 	return command.Run() == nil
 }
 
-func normalizeAttachments(payload any) []map[string]any {
-	switch value := payload.(type) {
-	case []any:
-		result := make([]map[string]any, 0, len(value))
-		for _, item := range value {
-			if itemMap, ok := item.(map[string]any); ok {
-				result = append(result, itemMap)
-			}
+func attachmentItemsFromRaw(raw []byte) ([]map[string]any, []json.RawMessage, error) {
+	var items []json.RawMessage
+	if err := json.Unmarshal(raw, &items); err != nil {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return nil, nil, err
 		}
-		return result
-	case map[string]any:
-		if items, ok := value["items"].([]any); ok {
-			result := make([]map[string]any, 0, len(items))
-			for _, item := range items {
-				if itemMap, ok := item.(map[string]any); ok {
-					result = append(result, itemMap)
-				}
+		if wrapped, ok := obj["items"]; ok {
+			if err := json.Unmarshal(wrapped, &items); err != nil {
+				return nil, nil, err
 			}
-			return result
+		} else {
+			items = []json.RawMessage{json.RawMessage(raw)}
 		}
-		return []map[string]any{value}
-	default:
-		return nil
 	}
+	decoded := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		var itemMap map[string]any
+		if err := json.Unmarshal(item, &itemMap); err == nil {
+			decoded = append(decoded, itemMap)
+		}
+	}
+	return decoded, items, nil
+}
+
+func marshalRawArray(items []json.RawMessage) []byte {
+	var buf bytes.Buffer
+	buf.WriteByte('[')
+	for i, item := range items {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		buf.Write(item)
+	}
+	buf.WriteByte(']')
+	return buf.Bytes()
+}
+
+func injectRawField(rawObj []byte, key string, value []byte) ([]byte, error) {
+	trimmed := bytes.TrimSpace(rawObj)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return nil, errors.New("claim response is not a json object")
+	}
+	body := bytes.TrimSpace(trimmed[1 : len(trimmed)-1])
+	keyJSON, err := json.Marshal(key)
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	if len(body) > 0 {
+		buf.Write(body)
+		buf.WriteByte(',')
+	}
+	buf.Write(keyJSON)
+	buf.WriteByte(':')
+	buf.Write(value)
+	buf.WriteByte('}')
+	return buf.Bytes(), nil
 }
 
 func attachmentName(attachment map[string]any) string {
