@@ -19,6 +19,9 @@ Then fill in the real credentials and URLs in your local `config.yaml`.
 `config.yaml` is sensitive and should stay local because it contains real credentials and tokens.
 Keep only `config.example.yaml` in version control. The real `config.yaml` should stay local and uncommitted.
 
+`ai_product` and `ai_tenant` name the Lea deployment a context talks to (e.g. `claims-ai` / `hlas`).
+The AI token is minted for that product and tenant; without them Hub rejects the token.
+
 `output_dir` is optional.
 
 - if `output_dir` is empty or omitted, the CLI uses the OS-standard default location
@@ -37,10 +40,53 @@ go build -o claim ./cmd/claim
 ./claim version
 ```
 
+## Dispatch a claim to Lea AI
+
+```bash
+# fetch from ClaimHub (with attachments) and run the transformizer, wait for the result
+./claim dispatch transformizer -i 31181 --wait --save
+
+# run a claim saved earlier with `claim get --save`; `t` is short for transformizer
+./claim dispatch t --file ./claims/claim-31181-4001.json --wait
+
+# full assessment (`ass` for short); list every task with `claim dispatch list`
+./claim dispatch assessment -i 31181 --wait --save
+
+# document processing (`doc`); --overwrite reprocesses attachments that already have documents
+./claim dispatch documents -i 31181 --overwrite --wait
+
+# pre-assessment (`pre`) and document readiness (`ready`)
+./claim dispatch pre -i 31181 --wait
+./claim dispatch ready -i 31181 --wait   # readiness has no run status: --wait prints the current evaluation
+
+# from a pipe or the clipboard
+cat claim-31181-4001.json | ./claim dispatch t --wait
+./claim get -i 31181 | ./claim dispatch t --wait
+./claim dispatch t --clipboard --wait
+```
+
+`--wait` polls the task's result route by its `task_id` until SUCCESS or FAILURE and prints
+the result (transformation, assessment, or the document batch). `--save` writes it under
+`<output_dir>/<task>/`. Without `--wait` the command returns right after dispatch.
+
 Release build with an explicit version:
 
 ```bash
 go build -ldflags "-X claim-cli/internal/cli.version=0.1.0" -o claim ./cmd/claim
+```
+
+## From Release
+
+Each GitHub release provides platform-specific archives.
+Each archive contains a single binary named `claim`.
+
+Typical install flow:
+
+```bash
+mkdir -p ~/.local/bin
+tar -xzf claim-cli_<platform>.tar.gz
+mv claim ~/.local/bin/claim
+chmod +x ~/.local/bin/claim
 ```
 
 If you want to use `claim` directly from anywhere:
@@ -107,8 +153,10 @@ Fetch claims:
 ```bash
 ./claim get -i 10129
 ./claim get -i 10129 --save
-./claim get -i 10129 --format internal --copy
+./claim get -i 10129 --copy
 ```
+
+`get` returns the raw ClaimHub payload. To check that Lea AI can read it, use `validate`.
 
 Clipboard behavior:
 
@@ -119,11 +167,15 @@ For convenience there is copy option as sometimes we need claim body to provide 
 - `--copy` forces clipboard copy for a single command
 - to disable default clipboard copying, set `defaults.copy: false` in `config.yaml`
 
-Formats:
+Validate a claim against Lea AI (`POST /api/v1/claims/claim-data`): the body must parse and the
+policy in `policyInsured` must resolve. Prints the policy found and the perils Hub recognised,
+or Hub's full error body on failure. Takes the same inputs as `dispatch`.
 
-- `raw`: the original ClaimHub claim payload as returned from ClaimHub
-- `internal`: the normalized internal `ClaimData` response from `POST /api/v1/claim/claim-data`. This is useful to quickly check whether Lea AI can compile the ClaimHub claim into internal claim data, for example whether the policy exists and resolves correctly.
-- `summary`: TODO - Intended meaning is a compact claim summary grouped by claim type.
+```bash
+./claim validate -i 10129
+cat claim-10129-123456.json | ./claim validate
+./claim validate --clipboard --full   # whole normalized ClaimData
+```
 
 Download attachments:
 

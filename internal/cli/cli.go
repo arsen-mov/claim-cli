@@ -34,7 +34,6 @@ type config struct {
 type defaultsConfig struct {
 	OutputDir    string `yaml:"output_dir"`
 	AIAPIVersion string `yaml:"ai_api_version"`
-	Format       string `yaml:"format"`
 	Attachments  bool   `yaml:"attachments"`
 	Copy         bool   `yaml:"copy"`
 }
@@ -44,6 +43,8 @@ type contextConfig struct {
 	AIAuthURL           string `yaml:"ai_auth_url"`
 	AIAPIUsername       string `yaml:"ai_api_username"`
 	AIAPIPassword       string `yaml:"ai_api_password"`
+	AIProduct           string `yaml:"ai_product"`
+	AITenant            string `yaml:"ai_tenant"`
 	ClaimHubBaseURL     string `yaml:"claimhub_base_url"`
 	ClaimHubAPIURL      string `yaml:"claimhub_api_url"`
 	ClaimHubAPIToken    string `yaml:"claimhub_api_token"`
@@ -107,6 +108,10 @@ func Run(args []string) error {
 		return runContextCommand(*configPath, append([]string{"use"}, remaining[1:]...))
 	case "download":
 		return runDownloadCommand(*configPath, *contextName, remaining[1:])
+	case "dispatch":
+		return runDispatchCommand(*configPath, *contextName, remaining[1:])
+	case "validate":
+		return runValidateCommand(*configPath, *contextName, remaining[1:])
 	case "get":
 		return runGetCommand(*configPath, *contextName, remaining[1:])
 	case "resolve":
@@ -140,10 +145,15 @@ func printRootHelp() {
 	fmt.Println("  context list           List all contexts")
 	fmt.Println("  context use NAME       Switch current context")
 	fmt.Println()
-	fmt.Println("Claim Commands")
+	fmt.Println("ClaimHub Commands")
 	fmt.Println("  get                    Fetch a claim payload")
 	fmt.Println("  resolve                Resolve claim id <-> claim no")
 	fmt.Println("  download               Download claim attachment(s)")
+	fmt.Println()
+	fmt.Println("Claims AI Commands")
+	fmt.Println("  validate               Build claim data on Hub: body valid, policy found, perils")
+	fmt.Println("  dispatch TASK          Dispatch a claim to a Lea AI task (t, ass, pre, doc, ready)")
+	fmt.Println("  dispatch list          List dispatchable tasks")
 	fmt.Println("  version                Show CLI version")
 }
 
@@ -211,7 +221,6 @@ func runGetCommand(configPath, contextOverride string, args []string) error {
 	fs.SetOutput(io.Discard)
 	claimID := fs.Int("i", 0, "claim id")
 	claimNo := fs.Int("n", 0, "claim number")
-	format := fs.String("format", "", "raw|internal|summary")
 	attachments := fs.Bool("attachments", false, "include attachments")
 	noAttachments := fs.Bool("no-attachments", false, "exclude attachments")
 	copyOutput := fs.Bool("copy", false, "copy output to clipboard")
@@ -221,7 +230,7 @@ func runGetCommand(configPath, contextOverride string, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			fmt.Println("Usage")
-			fmt.Println("  claim get (-i CLAIM_ID | -n CLAIM_NO) [--format raw|internal|summary]")
+			fmt.Println("  claim get (-i CLAIM_ID | -n CLAIM_NO)")
 			fmt.Println("            [--attachments|--no-attachments] [--copy] [--save]")
 			fmt.Println("            [--output-dir DIR] [--timeout SECONDS]")
 			return nil
@@ -238,17 +247,6 @@ func runGetCommand(configPath, contextOverride string, args []string) error {
 	}
 	claimsOutputDir := resolveClaimsOutputDir(rt, *outputDir)
 
-	selectedFormat := strings.TrimSpace(*format)
-	if selectedFormat == "" {
-		selectedFormat = rt.cfg.Defaults.Format
-	}
-	if selectedFormat == "" {
-		selectedFormat = "raw"
-	}
-	if selectedFormat != "raw" && selectedFormat != "internal" && selectedFormat != "summary" {
-		return fmt.Errorf("unsupported format %q", selectedFormat)
-	}
-
 	if *attachments && *noAttachments {
 		return errors.New("provide at most one of --attachments or --no-attachments")
 	}
@@ -263,7 +261,7 @@ func runGetCommand(configPath, contextOverride string, args []string) error {
 	if *copyOutput {
 		shouldCopyOutput = true
 	}
-	logf("context=%s claimhub_tenant=%s ai=%s format=%s attachments=%t copy=%t", rt.contextName, rt.context.ClaimHubTenant, rt.context.AIAPIURL, selectedFormat, includeAttachments, shouldCopyOutput)
+	logf("context=%s claimhub_tenant=%s attachments=%t copy=%t", rt.contextName, rt.context.ClaimHubTenant, includeAttachments, shouldCopyOutput)
 
 	claim, claimRaw, err := fetchClaim(rt, *claimID, *claimNo)
 	if err != nil {
@@ -280,28 +278,15 @@ func runGetCommand(configPath, contextOverride string, args []string) error {
 		attachmentsRaw = attsRaw
 	}
 
-	var result any = claim
-	if selectedFormat == "raw" {
-		finalRaw := claimRaw
-		if includeAttachments {
-			finalRaw, err = injectRawField(finalRaw, "attachments", marshalRawArray(attachmentsRaw))
-			if err != nil {
-				return err
-			}
-		}
-		result = json.RawMessage(finalRaw)
-	} else {
-		converted, err := toInternalClaim(rt, claim, selectedFormat == "summary")
+	finalRaw := claimRaw
+	if includeAttachments {
+		finalRaw, err = injectRawField(finalRaw, "attachments", marshalRawArray(attachmentsRaw))
 		if err != nil {
 			return err
 		}
-		result = converted
 	}
-
-	outputText, err := renderOutput(result, selectedFormat)
-	if err != nil {
-		return err
-	}
+	result := json.RawMessage(finalRaw)
+	outputText := prettyJSON(finalRaw)
 
 	if *saveOutput {
 		path, err := saveOutputFile(claimsOutputDir, result)
@@ -488,6 +473,459 @@ func runDownloadCommand(configPath, contextOverride string, args []string) error
 		fmt.Fprintf(os.Stderr, "Saved: %s\n", path)
 	}
 	return nil
+}
+
+// Every task answers with a TaskSentResponse; the result route is polled with
+// {task_id} / {claim_id} filled in until statusField reads SUCCESS or FAILURE.
+// An empty statusField means the route has no run status: the first 200 is the result.
+type dispatchTask struct {
+	name        string
+	alias       string
+	description string
+	dispatch    string
+	result      string
+	statusField string
+	overwrite   bool // accepts the overwrite flag in its request body
+}
+
+var dispatchTasks = []dispatchTask{
+	{
+		name:        "transformizer",
+		alias:       "t",
+		description: "Run transformizer",
+		dispatch:    "/claim/transformizer",
+		result:      "/claim/transformizer/{task_id}",
+		statusField: "status",
+	},
+	{
+		name:        "assessment",
+		alias:       "ass",
+		description: "Run assessment",
+		dispatch:    "/assess/claim/v2",
+		result:      "/assess/claim/assessment/v2/{task_id}",
+		statusField: "status",
+	},
+	{
+		name:        "pre-assessment",
+		alias:       "pre",
+		description: "Run pre-assessment",
+		dispatch:    "/assess/claim/pre-assessment",
+		result:      "/assess/claim/{claim_id}/pre-assessment",
+		statusField: "status_pre",
+	},
+	{
+		name:        "documents",
+		alias:       "doc",
+		description: "Run document processing (--overwrite redoes processed ones)",
+		dispatch:    "/claim/documents/process",
+		result:      "/claim/documents/source/{task_id}",
+		statusField: "status",
+		overwrite:   true,
+	},
+	{
+		name:        "readiness",
+		alias:       "ready",
+		description: "Run document readiness (no run status: --wait shows the current evaluation)",
+		dispatch:    "/claim/document/readiness/process",
+		result:      "/claim/{claim_id}/document/readiness",
+	},
+}
+
+func (task dispatchTask) resultPath(taskID string, claimID int) string {
+	path := strings.ReplaceAll(task.result, "{task_id}", taskID)
+	return strings.ReplaceAll(path, "{claim_id}", strconv.Itoa(claimID))
+}
+
+func findDispatchTask(name string) (dispatchTask, bool) {
+	for _, task := range dispatchTasks {
+		if task.name == name || task.alias == name {
+			return task, true
+		}
+	}
+	return dispatchTask{}, false
+}
+
+func printDispatchTasks() {
+	fmt.Println("Tasks")
+	for _, task := range dispatchTasks {
+		fmt.Printf("  %-14s %-5s %s\n", task.name, task.alias, task.description)
+	}
+}
+
+// One claim in, from ClaimHub or from a local copy of its payload.
+type claimInput struct {
+	claimID   *int
+	claimNo   *int
+	filePath  *string
+	clipboard *bool
+}
+
+func addClaimInputFlags(fs *flag.FlagSet) claimInput {
+	return claimInput{
+		claimID:   fs.Int("i", 0, "claim id"),
+		claimNo:   fs.Int("n", 0, "claim number"),
+		filePath:  fs.String("file", "", "claim json file (as saved by claim get --save), or - for stdin"),
+		clipboard: fs.Bool("clipboard", false, "read the claim json from the clipboard"),
+	}
+}
+
+const claimInputUsage = "(-i CLAIM_ID | -n CLAIM_NO | --file PATH | --clipboard | <stdin>)"
+
+func (in claimInput) resolveSource() error {
+	sources := 0
+	if *in.claimID != 0 {
+		sources++
+	}
+	if *in.claimNo != 0 {
+		sources++
+	}
+	if strings.TrimSpace(*in.filePath) != "" {
+		sources++
+	}
+	if *in.clipboard {
+		sources++
+	}
+	if sources == 0 && stdinIsPiped() {
+		*in.filePath = "-"
+		sources = 1
+	}
+	if sources != 1 {
+		return errors.New("provide exactly one of -i, -n, --file, --clipboard, or pipe the claim json to stdin")
+	}
+	return nil
+}
+
+func (in claimInput) read(rt runtimeConfig) ([]byte, map[string]any, error) {
+	var claimRaw []byte
+	var err error
+	switch {
+	case *in.clipboard:
+		claimRaw, err = readClipboard()
+	case strings.TrimSpace(*in.filePath) == "-":
+		claimRaw, err = io.ReadAll(os.Stdin)
+	case strings.TrimSpace(*in.filePath) != "":
+		claimRaw, err = os.ReadFile(*in.filePath)
+	default:
+		var claim map[string]any
+		var raw []byte
+		claim, raw, err = fetchClaim(rt, *in.claimID, *in.claimNo)
+		if err != nil {
+			return nil, nil, err
+		}
+		_, attachmentsRaw, err := fetchAttachments(rt, claim)
+		if err != nil {
+			return nil, nil, err
+		}
+		claimRaw, err = injectRawField(raw, "attachments", marshalRawArray(attachmentsRaw))
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	var claim map[string]any
+	if err := json.Unmarshal(claimRaw, &claim); err != nil {
+		return nil, nil, fmt.Errorf("claim is not a json object: %w", err)
+	}
+	return claimRaw, claim, nil
+}
+
+func loadAIRuntime(configPath, contextOverride, outputOverride string) (runtimeConfig, error) {
+	rt, err := loadRuntime(configPath, contextOverride, outputOverride, 60)
+	if err != nil {
+		return runtimeConfig{}, err
+	}
+	if strings.TrimSpace(rt.context.AIProduct) == "" || strings.TrimSpace(rt.context.AITenant) == "" {
+		return runtimeConfig{}, fmt.Errorf("context %q needs ai_product and ai_tenant to call Claims AI", rt.contextName)
+	}
+	return rt, nil
+}
+
+func runValidateCommand(configPath, contextOverride string, args []string) error {
+	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	input := addClaimInputFlags(fs)
+	full := fs.Bool("full", false, "print the whole normalized claim data")
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Println("Usage")
+			fmt.Println("  claim validate " + claimInputUsage + " [--full]")
+			fmt.Println()
+			fmt.Println("Builds the claim data on Hub: the body must validate and the policy")
+			fmt.Println("(policyInsured) must resolve. Prints the perils Hub recognised.")
+			return nil
+		}
+		return err
+	}
+	if err := input.resolveSource(); err != nil {
+		return err
+	}
+	rt, err := loadAIRuntime(configPath, contextOverride, "")
+	if err != nil {
+		return err
+	}
+	logf("context=%s ai=%s product=%s tenant=%s validate", rt.contextName, rt.context.AIAPIURL, rt.context.AIProduct, rt.context.AITenant)
+	claimRaw, _, err := input.read(rt)
+	if err != nil {
+		return err
+	}
+	token, err := fetchAIToken(rt)
+	if err != nil {
+		return err
+	}
+	body, err := injectRawField([]byte("{}"), "claim", claimRaw)
+	if err != nil {
+		return err
+	}
+	endpoint := aiEndpoint(rt, "/claims/claim-data")
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := rt.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		// Hub's unified error body carries the field-level validation errors; show all of it.
+		fmt.Fprintf(os.Stderr, "Invalid: Hub answered %d\n", resp.StatusCode)
+		fmt.Println(prettyJSON(raw))
+		return fmt.Errorf("claim data rejected with status %d", resp.StatusCode)
+	}
+	if *full {
+		fmt.Println(prettyJSON(raw))
+		return nil
+	}
+	var data map[string]any
+	if err := json.Unmarshal(raw, &data); err != nil {
+		return err
+	}
+	policy, _ := data["policy"].(map[string]any)
+	trip, _ := data["trip"].(map[string]any)
+	claim, _ := data["claim"].(map[string]any)
+	items, _ := claim["items"].([]any)
+	fmt.Fprintln(os.Stderr, "Valid: claim data built")
+	fmt.Printf("claim_id  %v\n", claim["claim_id"])
+	fmt.Printf("policy    pw_id=%v identifier=%v version=%v insured=%v\n", policy["pw_id"], policy["identifier"], policy["version"], policy["insured_name"])
+	if covered, ok := policy["covered"].(map[string]any); ok {
+		fmt.Printf("covered   %v -> %v\n", covered["from_date"], covered["to_date"])
+	}
+	fmt.Printf("trip      %v\n", compactJSON(trip))
+	fmt.Printf("perils    %d\n", len(items))
+	for _, item := range items {
+		peril, _ := item.(map[string]any)
+		fmt.Printf("  - %v / %v  %v  cost=%v %v\n", peril["claim_type"], peril["benefit_type"], peril["name"], peril["cost"], peril["original_currency"])
+	}
+	return nil
+}
+
+func prettyJSON(raw []byte) string {
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, raw, "", "  "); err != nil {
+		return string(raw)
+	}
+	return buf.String()
+}
+
+func compactJSON(value any) string {
+	b, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Sprint(value)
+	}
+	return string(b)
+}
+
+func runDispatchCommand(configPath, contextOverride string, args []string) error {
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return errors.New("usage: claim dispatch (TASK|list) (-i CLAIM_ID | -n CLAIM_NO | --file PATH) [--wait] [--save]")
+	}
+	if args[0] == "list" {
+		printDispatchTasks()
+		return nil
+	}
+	task, ok := findDispatchTask(args[0])
+	if !ok {
+		return fmt.Errorf("unknown task %q, see: claim dispatch list", args[0])
+	}
+
+	fs := flag.NewFlagSet("dispatch", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	input := addClaimInputFlags(fs)
+	overwrite := fs.Bool("overwrite", false, "documents: reprocess attachments that already have documents")
+	wait := fs.Bool("wait", false, "poll until the task finishes")
+	pollInterval := fs.Float64("poll-interval", 5, "seconds between polls")
+	saveOutput := fs.Bool("save", false, "save the result to file")
+	outputDir := fs.String("output-dir", "", "output directory")
+	timeout := fs.Float64("timeout", 900, "overall timeout seconds when waiting")
+	if err := fs.Parse(args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			fmt.Println("Usage")
+			fmt.Println("  claim dispatch TASK " + claimInputUsage)
+			fmt.Println("                 [--wait] [--poll-interval SECONDS] [--save] [--output-dir DIR] [--timeout SECONDS]")
+			fmt.Println("  claim dispatch list")
+			fmt.Println()
+			printDispatchTasks()
+			return nil
+		}
+		return err
+	}
+	if err := input.resolveSource(); err != nil {
+		return err
+	}
+
+	rt, err := loadAIRuntime(configPath, contextOverride, *outputDir)
+	if err != nil {
+		return err
+	}
+	logf("context=%s ai=%s product=%s tenant=%s dispatch %s", rt.contextName, rt.context.AIAPIURL, rt.context.AIProduct, rt.context.AITenant, task.name)
+
+	claimRaw, claim, err := input.read(rt)
+	if err != nil {
+		return err
+	}
+	dispatchedClaimID, ok := asInt(claim["id"])
+	if !ok {
+		return errors.New("claim has no id")
+	}
+
+	token, err := fetchAIToken(rt)
+	if err != nil {
+		return err
+	}
+	if *overwrite && !task.overwrite {
+		return fmt.Errorf("--overwrite is only for the documents task, not %s", task.name)
+	}
+	body, err := injectRawField([]byte("{}"), "claim", claimRaw)
+	if err != nil {
+		return err
+	}
+	if *overwrite {
+		body, err = injectRawField(body, "overwrite", []byte("true"))
+		if err != nil {
+			return err
+		}
+	}
+	endpoint := aiEndpoint(rt, task.dispatch)
+	logf("dispatching claim id=%d via POST %s", dispatchedClaimID, endpoint)
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	sentRaw, err := doJSONRaw(rt.client, req)
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(sentRaw)) == 0 {
+		fmt.Fprintln(os.Stderr, "Nothing to dispatch: Hub found no input to process")
+		return nil
+	}
+	var sent map[string]any
+	if err := json.Unmarshal(sentRaw, &sent); err != nil {
+		return err
+	}
+	taskID, _ := sent["task_id"].(string)
+	if taskID == "" {
+		return fmt.Errorf("dispatch response has no task_id: %s", string(sentRaw))
+	}
+	sentStatus, _ := sent["status"].(string)
+	if sentStatus == "" {
+		sentStatus = "QUEUED"
+	}
+	fmt.Fprintf(os.Stderr, "Dispatched: task=%v task_id=%s status=%s\n", sent["name"], taskID, sentStatus)
+	if !*wait {
+		return nil
+	}
+
+	resultEndpoint := aiEndpoint(rt, task.resultPath(taskID, dispatchedClaimID))
+	deadline := time.Now().Add(time.Duration(*timeout * float64(time.Second)))
+	started := time.Now()
+	for {
+		time.Sleep(time.Duration(*pollInterval * float64(time.Second)))
+		req, err := http.NewRequest(http.MethodGet, resultEndpoint, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := rt.client.Do(req)
+		if err != nil {
+			return err
+		}
+		raw, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return err
+		}
+		status := "PENDING"
+		if resp.StatusCode == http.StatusNotFound {
+			// the result row does not exist until the worker writes it
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("result request failed: status=%d body=%s", resp.StatusCode, string(raw))
+		} else if task.statusField == "" {
+			status = "SUCCESS"
+		} else {
+			var result map[string]any
+			if err := json.Unmarshal(raw, &result); err != nil {
+				return err
+			}
+			status, _ = result[task.statusField].(string)
+		}
+		logf("claim id=%d %s status=%s elapsed=%s", dispatchedClaimID, task.name, status, time.Since(started).Round(time.Second))
+		if status == "SUCCESS" || status == "FAILURE" {
+			if *saveOutput {
+				dir := resolveTaskOutputDir(rt, *outputDir, task.name)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					return err
+				}
+				claimNoValue, _ := stringValue(claim["no"])
+				path := filepath.Join(dir, fmt.Sprintf("%s-%d-%s.json", task.name, dispatchedClaimID, claimNoValue))
+				pretty, err := json.MarshalIndent(json.RawMessage(raw), "", "  ")
+				if err != nil {
+					return err
+				}
+				if err := os.WriteFile(path, pretty, 0o644); err != nil {
+					return err
+				}
+				fmt.Fprintf(os.Stderr, "Saved: %s\n", path)
+			}
+			pretty, err := json.MarshalIndent(json.RawMessage(raw), "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Println(string(pretty))
+			if status == "FAILURE" {
+				return fmt.Errorf("%s failed for claim id=%d", task.name, dispatchedClaimID)
+			}
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for %s on claim id=%d (last status=%s)", time.Since(started).Round(time.Second), task.name, dispatchedClaimID, status)
+		}
+	}
+}
+
+func aiEndpoint(rt runtimeConfig, path string) string {
+	version := strings.TrimSpace(rt.cfg.Defaults.AIAPIVersion)
+	if version == "" {
+		version = "v1"
+	}
+	return strings.TrimRight(rt.context.AIAPIURL, "/") + "/api/" + version + path
+}
+
+func resolveTaskOutputDir(rt runtimeConfig, outputOverride, task string) string {
+	if strings.TrimSpace(outputOverride) != "" {
+		if filepath.IsAbs(outputOverride) {
+			return outputOverride
+		}
+		return filepath.Join(rt.configDir, outputOverride)
+	}
+	return filepath.Join(rt.outputDir, task)
 }
 
 func resolveDefaultConfigPath() string {
@@ -937,42 +1375,18 @@ func cookieHeader(cookies map[string]string) string {
 	return strings.Join(parts, "; ")
 }
 
-func toInternalClaim(rt runtimeConfig, claim map[string]any, summary bool) (map[string]any, error) {
-	if summary {
-		return nil, errors.New("summary format is not supported by the current Hub API")
-	}
-
-	token, err := fetchAIToken(rt)
-	if err != nil {
-		return nil, err
-	}
-	body, err := json.Marshal(map[string]any{"claim": claim})
-	if err != nil {
-		return nil, err
-	}
-	endpoint := strings.TrimRight(rt.context.AIAPIURL, "/") + "/api/" + rt.cfg.Defaults.AIAPIVersion + "/claims/claim-data"
-	if strings.TrimSpace(rt.cfg.Defaults.AIAPIVersion) == "" {
-		endpoint = strings.TrimRight(rt.context.AIAPIURL, "/") + "/api/v1/claim/claim-data"
-	}
-	logf("calling AI internal conversion via %s", endpoint)
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	var result map[string]any
-	if err := doJSON(rt.client, req, &result); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
 func fetchAIToken(rt runtimeConfig) (string, error) {
 	form := url.Values{}
 	form.Set("grant_type", "password")
 	form.Set("username", rt.context.AIAPIUsername)
 	form.Set("password", rt.context.AIAPIPassword)
+	// Without an audience the auth server mints an identity token, which Hub rejects.
+	if strings.TrimSpace(rt.context.AIProduct) != "" {
+		form.Set("audience", rt.context.AIProduct)
+	}
+	if strings.TrimSpace(rt.context.AITenant) != "" {
+		form.Set("tenant", rt.context.AITenant)
+	}
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(rt.context.AIAuthURL, "/")+"/api/v1/oauth2/token", strings.NewReader(form.Encode()))
 	if err != nil {
 		return "", err
@@ -988,75 +1402,6 @@ func fetchAIToken(rt runtimeConfig) (string, error) {
 	}
 	logf("AI auth token acquired from %s", strings.TrimRight(rt.context.AIAuthURL, "/")+"/api/v1/oauth2/token")
 	return token, nil
-}
-
-func renderOutput(result any, format string) (string, error) {
-	if format == "raw" || format == "summary" {
-		b, err := json.MarshalIndent(result, "", "  ")
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
-	}
-	resultMap, ok := result.(map[string]any)
-	if !ok {
-		return "", errors.New("internal result is not an object")
-	}
-	claim, ok := resultMap["claim"].(map[string]any)
-	if !ok {
-		return "", errors.New("internal result has no claim object")
-	}
-	items, _ := claim["items"].([]any)
-	claimTypes := map[string]struct{}{}
-	benefitTypes := map[string]struct{}{}
-	for _, item := range items {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		if claimType, ok := itemMap["claim_type"].(string); ok && claimType != "" {
-			claimTypes[claimType] = struct{}{}
-		}
-		if benefitType, ok := itemMap["benefit_type"].(string); ok && benefitType != "" {
-			benefitTypes[benefitType] = struct{}{}
-		}
-	}
-	lines := []string{}
-	summary, err := json.MarshalIndent(map[string]any{
-		"claim_id":      claim["claim_id"],
-		"peril_count":   len(items),
-		"claim_types":   sortedKeys(claimTypes),
-		"benefit_types": sortedKeys(benefitTypes),
-	}, "", "  ")
-	if err != nil {
-		return "", err
-	}
-	lines = append(lines, string(summary))
-	for index, item := range items {
-		itemMap, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		lines = append(lines, fmt.Sprintf("\nPeril %d", index+1))
-		payload, err := json.MarshalIndent(map[string]any{
-			"benefit_name":      itemMap["benefit_name"],
-			"benefit_type":      itemMap["benefit_type"],
-			"claim_type":        itemMap["claim_type"],
-			"name":              itemMap["name"],
-			"incident_details":  itemMap["details"],
-			"cost":              itemMap["cost"],
-			"original_cost":     itemMap["original_cost"],
-			"original_currency": itemMap["original_currency"],
-			"date":              itemMap["date"],
-			"expense_id":        itemMap["id"],
-			"logged_hours":      itemMap["logged_hours"],
-		}, "", "  ")
-		if err != nil {
-			return "", err
-		}
-		lines = append(lines, string(payload))
-	}
-	return strings.Join(lines, "\n"), nil
 }
 
 func saveOutputFile(outputDir string, result any) (string, error) {
@@ -1105,6 +1450,31 @@ func renderPreview(text string, maxLines int) string {
 		return text
 	}
 	return strings.Join(lines[:maxLines], "\n") + fmt.Sprintf("\n... (%d more lines copied)", len(lines)-maxLines)
+}
+
+func stdinIsPiped() bool {
+	info, err := os.Stdin.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice == 0
+}
+
+func readClipboard() ([]byte, error) {
+	var command *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		command = exec.Command("pbpaste")
+	case "windows":
+		command = exec.Command("powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw")
+	default:
+		command = exec.Command("wl-paste", "--no-newline")
+	}
+	out, err := command.Output()
+	if err != nil {
+		return nil, fmt.Errorf("clipboard unavailable: %w", err)
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil, errors.New("clipboard is empty")
+	}
+	return out, nil
 }
 
 func copyToClipboard(text string) bool {
@@ -1255,15 +1625,6 @@ func interactivePick(attachments []map[string]any) ([]map[string]any, error) {
 		selected = append(selected, attachments[idx-1])
 	}
 	return selected, nil
-}
-
-func sortedKeys(values map[string]struct{}) []string {
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return keys
 }
 
 func asInt(value any) (int, bool) {

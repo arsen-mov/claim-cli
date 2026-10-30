@@ -3,7 +3,6 @@ current-context: local
 defaults:
   output_dir: ""
   ai_api_version: v1
-  format: raw
   attachments: true
   copy: false
 contexts:
@@ -12,6 +11,8 @@ contexts:
     ai_auth_url: http://0.0.0.0:8002
     ai_api_username: admin
     ai_api_password: admin
+    ai_product: claims-ai
+    ai_tenant: hlas
     claimhub_base_url: https://claimhub.example.com
     claimhub_api_url: https://api.claimhub.example.com
     claimhub_api_token: token
@@ -24,6 +25,8 @@ contexts:
     ai_auth_url: http://auth.ancileo.uat
     ai_api_username: replace-me
     ai_api_password: replace-me
+    ai_product: claims-ai
+    ai_tenant: ancileo
     claimhub_base_url: https://claimhub-uat.example.com
     claimhub_api_url: https://api.claimhub-uat.example.com
     claimhub_api_token: replace-me
